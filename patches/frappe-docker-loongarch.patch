@@ -1,0 +1,6 @@
+diff --git a/resources/nginx-entrypoint.sh b/resources/nginx-entrypoint.sh
+--- a/resources/nginx-entrypoint.sh
++++ b/resources/nginx-entrypoint.sh
+@@ -57 +57 @@ envsubst '${BACKEND}
+-nginx -g 'daemon off;'
++exec /usr/sbin/nginx -g 'daemon off;'

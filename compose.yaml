@@ -1,0 +1,157 @@
+x-erp-image: &erp-image
+  image: ${ERP_IMAGE:-erpnext-loong64:16.35.0}
+  pull_policy: never
+  restart: unless-stopped
+
+x-erp-volumes: &erp-volumes
+  - sites:/home/frappe/frappe-bench/sites
+  - logs:/home/frappe/frappe-bench/logs
+
+x-app-service: &app-service
+  <<: *erp-image
+  volumes: *erp-volumes
+  depends_on:
+    create-site:
+      condition: service_completed_successfully
+
+services:
+  db:
+    image: ghcr.io/loong64/mariadb:11.8
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      MARIADB_AUTO_UPGRADE: "1"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 20s
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - db-data:/var/lib/mysql
+
+  redis-cache:
+    image: ghcr.io/loong64/redis:7.4-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis-queue:
+    image: ghcr.io/loong64/redis:7.4-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - redis-queue-data:/data
+
+  configurator:
+    <<: *erp-image
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        set -e;
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host db;
+        bench set-config -gp db_port 3306;
+        bench set-config -g redis_cache redis://redis-cache:6379;
+        bench set-config -g redis_queue redis://redis-queue:6379;
+        bench set-config -g redis_socketio redis://redis-queue:6379;
+        bench set-config -gp socketio_port 9000;
+    volumes: *erp-volumes
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+
+  create-site:
+    <<: *erp-image
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        set -e;
+        if [ -f "sites/$${SITE_NAME}/site_config.json" ]; then
+          echo "Site $${SITE_NAME} already exists";
+        else
+          rm -rf "sites/$${SITE_NAME}";
+          bench new-site "$${SITE_NAME}" --mariadb-user-host-login-scope='%' --admin-password="$${ADMIN_PASSWORD}" --db-root-username=root --db-root-password="$${DB_PASSWORD}" --install-app erpnext --set-default;
+        fi;
+        bench --site "$${SITE_NAME}" enable-scheduler;
+    environment:
+      SITE_NAME: ${SITE_NAME:-frontend}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    volumes: *erp-volumes
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  backend:
+    <<: *app-service
+    environment:
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
+      GUNICORN_THREADS: ${GUNICORN_THREADS:-4}
+      GUNICORN_TIMEOUT: "120"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8000"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  websocket:
+    <<: *app-service
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+
+  queue-short:
+    <<: *app-service
+    command: ["bench", "worker", "--queue", "short,default"]
+
+  queue-long:
+    <<: *app-service
+    command: ["bench", "worker", "--queue", "long,default,short"]
+
+  scheduler:
+    <<: *app-service
+    command: ["bench", "schedule"]
+
+  frontend:
+    <<: *erp-image
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      NGINX_LISTEN_PORT: "8080"
+      FRAPPE_SITE_NAME_HEADER: ${SITE_NAME:-frontend}
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: "120"
+      CLIENT_MAX_BODY_SIZE: 50m
+    volumes: *erp-volumes
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+      websocket:
+        condition: service_started
+
+volumes:
+  db-data:
+  redis-queue-data:
+  sites:
+  logs:

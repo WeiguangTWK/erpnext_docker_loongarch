@@ -1,0 +1,211 @@
+
+FROM ghcr.io/loong64/node:24-trixie-slim AS node-base
+
+FROM ghcr.io/loong64/python:3.14-slim-trixie AS runtime-base
+
+ARG LOONGARCH_PYPI_URL=https://mirrors.loong64.com/pypi/simple
+
+COPY --from=node-base /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-base /usr/local/lib/node_modules /usr/local/lib/node_modules
+
+ENV PATH=/home/frappe/frappe-bench/env/bin:/usr/local/bin:${PATH}
+ENV PYTHONUNBUFFERED=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_EXTRA_INDEX_URL=${LOONGARCH_PYPI_URL}
+ENV UV_EXTRA_INDEX_URL=${LOONGARCH_PYPI_URL}
+
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bash \
+      ca-certificates \
+      curl \
+      git \
+      gettext-base \
+      jq \
+      less \
+      media-types \
+      mariadb-client \
+      postgresql-client \
+      redis-tools \
+      restic \
+      libpango-1.0-0 \
+      libharfbuzz0b \
+      libpangoft2-1.0-0 \
+      libpangocairo-1.0-0 \
+      libjpeg62-turbo \
+      libtiff6 \
+      libwebp7 \
+      liblcms2-2 \
+      libpq5 \
+      libmariadb3 \
+ && rm -rf /var/lib/apt/lists/* \
+ && python -m pip install --no-cache-dir frappe-bench \
+ && useradd -m -s /bin/bash frappe
+
+FROM runtime-base AS builder
+
+ENV UV_FIND_LINKS=/opt/loongarch-wheels
+ENV UV_CONSTRAINT=/opt/loongarch-constraints.txt
+
+ARG FRAPPE_VERSION=v16.34.0
+ARG ERPNEXT_VERSION=v16.35.0
+ARG MYSQLCLIENT_VERSION=2.2.7
+ARG DUCKDB_VERSION=1.4.3
+ARG BANKING_VITE_VERSION=7.2.2
+ARG BANKING_REACT_PLUGIN_VERSION=5.1.1
+ARG LIGHTNINGCSS_LOONG64_VERSION=1.33.0
+ARG TAILWIND_OXIDE_LOONG64_VERSION=4.3.2
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      pkg-config \
+      libmariadb-dev \
+      libpq-dev \
+      libffi-dev \
+      libldap2-dev \
+      libsasl2-dev \
+      libpango1.0-dev \
+      libcairo2-dev \
+      libjpeg-dev \
+      libtiff-dev \
+      libwebp-dev \
+      liblcms2-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && npm install -g yarn@1.22.22 \
+ && mkdir -p /opt/loongarch-wheels \
+ && printf '%s\n' \
+      "duckdb==${DUCKDB_VERSION}" \
+      > /opt/loongarch-constraints.txt \
+ && python -m pip wheel \
+      --no-cache-dir \
+      --no-deps \
+      --no-binary=mysqlclient \
+      --wheel-dir=/opt/loongarch-wheels \
+      "mysqlclient==${MYSQLCLIENT_VERSION}" \
+ && python -m pip download \
+      --no-cache-dir \
+      --no-deps \
+      --only-binary=:all: \
+      --extra-index-url="${LOONGARCH_PYPI_URL}" \
+      --dest=/opt/loongarch-wheels \
+      "duckdb==${DUCKDB_VERSION}" \
+ && chown -R frappe:frappe \
+      /opt/loongarch-wheels \
+      /opt/loongarch-constraints.txt
+
+USER frappe
+WORKDIR /home/frappe
+
+RUN bench init \
+      --frappe-branch="${FRAPPE_VERSION}" \
+      --frappe-path=https://github.com/frappe/frappe \
+      --no-procfile \
+      --no-backups \
+      --skip-redis-config-generation \
+      --verbose \
+      /home/frappe/frappe-bench
+
+WORKDIR /home/frappe/frappe-bench
+
+RUN bench get-app \
+      --branch="${ERPNEXT_VERSION}" \
+      --resolve-deps \
+      --skip-assets \
+      erpnext https://github.com/frappe/erpnext \
+ && cd apps/erpnext/banking \
+ && yarn add \
+      --exact \
+      --no-lockfile \
+      "vite@${BANKING_VITE_VERSION}" \
+      "@vitejs/plugin-react@${BANKING_REACT_PLUGIN_VERSION}" \
+ && yarn add \
+      --dev \
+      --exact \
+      --no-lockfile \
+      "@loong64/lightningcss-linux-loong64-gnu@${LIGHTNINGCSS_LOONG64_VERSION}" \
+ && ROLLUP_VERSION="$(node -p "require('rollup/package.json').version")" \
+ && yarn add \
+      --dev \
+      --exact \
+      --no-lockfile \
+      "@rollup/rollup-linux-loong64-gnu@${ROLLUP_VERSION}" \
+ && cp \
+      node_modules/@loong64/lightningcss-linux-loong64-gnu/lightningcss.linux-loong64-gnu.node \
+      node_modules/lightningcss/lightningcss.linux-loong64-gnu.node \
+ && curl -fL \
+      "https://github.com/loong64/tailwindcss/releases/download/v${TAILWIND_OXIDE_LOONG64_VERSION}/tailwindcss-oxide-linux-loong64-gnu.tgz" \
+      -o /tmp/tailwindcss-oxide-loong64.tgz \
+ && mkdir -p /tmp/tailwindcss-oxide-loong64 \
+ && tar -xzf /tmp/tailwindcss-oxide-loong64.tgz \
+      -C /tmp/tailwindcss-oxide-loong64 \
+ && OXIDE_BINARY="$(find /tmp/tailwindcss-oxide-loong64 -type f -name '*.node' -print -quit)" \
+ && test -n "${OXIDE_BINARY}" \
+ && cp "${OXIDE_BINARY}" \
+      node_modules/@tailwindcss/oxide/tailwindcss-oxide.linux-loong64-gnu.node \
+ && yarn build \
+ && cd /home/frappe/frappe-bench \
+ && bench build --app erpnext \
+ && bench version \
+ && echo '{}' > sites/common_site_config.json \
+ && cp -a sites/assets ./assets \
+ && rm -rf sites/assets \
+ && rm -rf apps/erpnext/banking/node_modules \
+ && find apps -mindepth 1 -type d -name .git -prune -exec rm -rf '{}' + \
+ && find /home/frappe/frappe-bench -type d -name __pycache__ -prune -exec rm -rf '{}' + \
+ && rm -rf /home/frappe/.cache \
+ && rm -rf /tmp/tailwindcss-oxide-loong64*
+
+FROM runtime-base AS production
+
+ARG FRAPPE_VERSION=v16.34.0
+ARG ERPNEXT_VERSION=v16.35.0
+
+LABEL org.opencontainers.image.title="ERPNext for LoongArch" \
+      org.opencontainers.image.version="${ERPNEXT_VERSION}" \
+      io.frappe.version="${FRAPPE_VERSION}" \
+      io.erpnext.version="${ERPNEXT_VERSION}"
+
+COPY --from=builder \
+  --chown=frappe:frappe \
+  /home/frappe/frappe-bench \
+  /home/frappe/frappe-bench
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       nginx gettext-base jq wait-for-it \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/nginx/sites-enabled/default \
+    && mkdir -p /etc/nginx/snippets /templates/nginx \
+    && sed -i '/user www-data/d' /etc/nginx/nginx.conf \
+    && ln -sf /dev/stdout /var/log/nginx/access.log \
+    && ln -sf /dev/stderr /var/log/nginx/error.log \
+    && touch /run/nginx.pid \
+    && chown -R frappe:frappe \
+       /etc/nginx /var/lib/nginx /var/log/nginx /run/nginx.pid
+
+COPY resources/nginx-template.conf /templates/nginx/frappe.conf.template
+COPY resources/security_headers.conf /etc/nginx/snippets/security_headers.conf
+COPY resources/nginx-entrypoint.sh /usr/local/bin/nginx-entrypoint.sh
+COPY resources/main-entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY resources/start.sh /usr/local/bin/start.sh
+
+RUN chmod 755 \
+    /usr/local/bin/nginx-entrypoint.sh \
+    /usr/local/bin/entrypoint.sh \
+    /usr/local/bin/start.sh
+
+WORKDIR /home/frappe/frappe-bench
+
+VOLUME ["/home/frappe/frappe-bench/sites", "/home/frappe/frappe-bench/logs"]
+
+EXPOSE 8000 9000
+
+USER frappe
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["/usr/local/bin/start.sh"]
